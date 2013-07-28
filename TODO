@@ -1,0 +1,6 @@
+#!/bin/sh
+# The best way to see what is 'to do' here is:
+
+   grep --color=always -PiRIn 'TO.{0}DO|FIX.{0}ME|[^\$]\?$' *
+
+# executed in the current directory.
