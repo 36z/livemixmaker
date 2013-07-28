@@ -1,0 +1,42 @@
+#!/bin/sh
+
+ARCH="$(arch)"
+CLASS="--class debian --class gnu-linux --class gnu --class os"
+modules="insmod gzio
+  insmod part_msdos
+  insmod ext2
+"
+# get distro name
+. /etc/os-release
+# get grub boot defaults
+. /etc/default/grub
+# if aufs is enabled, boot with it
+[ -e /etc/initramfs-tools/scripts/init-bottom/overlay ] && OVERLAY="overlay"
+
+cat <<END
+
+set timeout=3
+
+menuentry "$PRETTY_NAME ($ARCH)" $CLASS {
+  $modules
+  set root=(hd0,2)
+  search --no-floppy --set root --label live-rootfs
+  echo	'Loading Linux ...'
+  linux  /vmlinuz root=LABEL=live-rootfs $OVERLAY $GRUB_CMDLINE_LINUX_DEFAULT
+  echo	'Loading initial ramdisk ...'
+  initrd /initrd.img
+  boot
+}
+
+menuentry "$PRETTY_NAME (failsafe console)" $CLASS {
+  $modules
+  set root=(hd0,2)
+  search --no-floppy --set root --label live-rootfs
+  echo	'Loading Linux ...'
+  linux  /vmlinuz root=LABEL=live-rootfs single memtest noapic noapm nomodeset nosplash gfxpayload=text
+  echo	'Loading initial ramdisk ...'
+  initrd /initrd.img
+  boot
+}
+
+END

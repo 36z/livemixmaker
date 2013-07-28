@@ -1,0 +1,11 @@
+#!/bin/sh
+
+cat <<END
+
+menuentry 'Boot from hard drive...' {
+  #insmod ntfs  # TODO: test if required
+  set root=(hd1)
+  chainloader +1
+}
+
+END

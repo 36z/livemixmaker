@@ -1,0 +1,116 @@
+#!/bin/sh -e
+# based on the script from Voyage Linux
+
+case $1 in prereqs) exit 0; ;; esac
+
+export overlay
+
+for param in $(cat /proc/cmdline); do
+  case $param in
+    root=*) ROOTNAME=${param#root=}; ;;
+    overlay) overlay='aufs'; ;;
+  esac
+done
+
+if [ ! $overlay ]; then
+  exit 0  # I'm not loved. good bye
+fi
+
+. /scripts/functions  # source initramfs-tools provided helpers
+
+# source overlay configuration
+. $rootmnt/etc/overlay/vars.sh
+
+log_begin_msg "Setting up overlay $overlay on ${rootmnt} as root file system"
+
+if ! modprobe -b aufs brs=1; then
+  log_failure_msg 'overlay: Failed to load aufs.ko'
+  exit 0
+fi
+
+mkdir -p /overlay/aufs /overlay/rw /overlay/ro /overlay/ro/home /overlay/home
+
+# mount the temp file system
+# TODO: if it becomes relevant, amend tmpfs mount with mode=0755 or similar
+# TODO: test what the permissions are on the produced system, whether 'user' can write into /
+if ! mount -t tmpfs -o noatime,size=$TMPFS_SIZE overlay_rw /overlay/rw ; then
+  log_failure_msg 'overlay: failed to mount tmpfs'
+  exit 0
+fi
+
+# mount the home partition, if one exists, to temporary dir
+separate_home="True"
+if ! mount -t ext4 -o rw,errors=remount-ro,noatime,discard /dev/disk/by-label/live-home /overlay/home 2>/dev/null; then
+	log_warning_msg 'overlay: mounting separate /home failed'
+	unset separate_home
+fi
+
+# move real root (lower) out of the way
+if ! mount -o move $rootmnt /overlay/ro ; then
+  log_failure_msg 'overlay: failed to move root to /overlay/ro'
+  exit 0
+fi
+
+# after here, system won't boot since we moved root, so restore previous state on any further error
+trap "mount -o move /overlay/ro ${rootmnt}" EXIT
+
+# move /home in place, if it exists
+if [ $separate_home ] && ! mount -o move /overlay/home /overlay/ro/home ; then
+  log_failure_msg 'overlay: failed to move home to /overlay/ro/home'
+  exit 0
+fi
+
+# mount aufs over rw and ro
+# TODO: use udba=none mount option, hide ro branch as per aufs(5)
+if ! mount -t aufs -o noatime,trunc_xino,dirs=/overlay/rw:/overlay/ro=ro overlay /overlay/aufs ; then
+  log_failure_msg 'overlay: failed to mount aufs'
+  exit 0
+fi
+if [ $separate_home ]; then
+  mkdir -p /overlay/rw/home
+  if ! mount -t aufs -o noatime,trunc_xino,dirs=/overlay/rw/home:/overlay/ro/home=ro overlay_home /overlay/aufs/home ; then
+    echo 'overlay: failed to mount /home aufs'
+    log_failure_msg 'overlay: failed to mount /home aufs'
+    exit 0
+  fi
+fi
+
+# move the ro and rw branches inside aufs
+mkdir -p "/overlay/aufs/$RO_ROOT" "/overlay/aufs/$RW_ROOT"
+if  ! mount -o move "/overlay/ro" "/overlay/aufs/$RO_ROOT" ||
+    ! mount -o move "/overlay/rw" "/overlay/aufs/$RW_ROOT" ; then
+  log_failure_msg 'overlay: failed to move branches into /overlay/aufs/'
+  exit 0
+fi
+
+# fix fstab on tmpfs
+if ! grep -v '[[:space:]]\(/\|/home\)[[:space:]]' "/overlay/aufs/$RO_ROOT/etc/fstab" >/overlay/aufs/etc/fstab ; then
+  log_failure_msg 'overlay: failed to create /etc/fstab in aufs'
+  exit 0
+fi
+echo "# This is a DYNAMICALLY GENERATED /etc/fstab file.
+# See /etc/overlay/README for further information." >>/overlay/aufs/etc/fstab
+
+# This further does not appear to be needed.
+
+#~ TYPE_OPTIONS=$(cat /proc/mounts | grep $ROOT | cut -d' ' -f3,4)
+#~ echo "$ROOT /overlay/ro $TYPE_OPTIONS 0 1" >>/overlay/aufs/etc/fstab
+
+
+#~ # add back the root file system. mtab seems to be created by one of the init proceses. 
+#~ echo "echo aufs / aufs rw,br:/rw=rw:/ro=ro 0 0 >>/etc/mtab" >>/aufs/etc/rc.local
+#~ echo "echo aufs-tmpfs /rw tmpfs rw 0 0 >>/etc/mtab" >>/aufs/etc/rc.local 
+#~ echo exit 0 >>/aufs/etc/rc.local 
+
+# fix for apparmor
+#~ [ -e /overlay/aufs/etc/init.d/apparmor ] && chmod -x /overlay/aufs/etc/init.d/apparmor
+
+if ! mount -o move /overlay/aufs $rootmnt ; then
+  log_failure_msg "overlay: failed to move aufs to $rootmnt"
+  exit 0
+fi
+trap '' EXIT  # clear the trap from before
+old_quiet="$quiet" && unset quiet
+log_success_msg 'Using overlay aufs filesystem.'
+quiet="$old_quiet"
+exit 0 

@@ -1,0 +1,48 @@
+# This file is read by rsync when sycing overlay tmpfs filesystem to disk,
+# e.g. by running /etc/init.d/overlay-sync
+# The contents of this file are rsync filters as per man rsync /^FILTER RULES.
+# - only prevents copying, H deletes it completely.
+
+# these are mounted separately anyway
+- /dev/*
+H /sys/*
+H /proc/*
+
+# we overwrite fstab file in initramfs script; better not save it then
+- /etc/fstab
+H /etc/mtab
+
+# we don't want to keep stale logs
+H /var/log/**.gz
+H /var/log/**.[0-9]
+
+#+ /var/log/apt/*.log
+#+ /var/log/aptitude
+#+ /var/log/dpkg.log
+#+ /var/log/syslog
+#H /var/log/*
+
+# some caches are necessary. these aren't
++ /var/cache/man/index.*
+H /var/cache/man/*
+H /var/lib/urandom/random-seed
+H /var/cache/apt/archives/*
+H /var/cache/apt/*.bin
+H /var/cache/apt/*.bin.*
+H /home/user/.mozilla/firefox/*/Cache/*
+
+# don't save locks and session files, if they by chance exist
+H /home/*/.dbus/*
+H /home/*/.pulse/*
+H /home/*/.cache/*
+
+# don't accidentally recurse
+- /overlay
+
+# we trust this is set by network-manager (or appropriate) always anew
+- /etc/resolv.conf
+
+# these are supposed to be temporary and not (necessarily) persist reboot
+- /run/*
+- /var/run
+H /tmp/*

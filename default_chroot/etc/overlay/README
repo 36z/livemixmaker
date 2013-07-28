@@ -1,0 +1,24 @@
+
+This distribution uses an 'overlay filesystem' (currently aufs) to ease
+the burden on your likely lifetime-write-limited (e.g. flash) drive.
+On boot, a RAM-based tmpfs filesystem is laid over the root filesystem,
+equally over a separate /home partition, if it has LABEL='live-home'.
+Any future writes to files on the root filesystem go through the overlay.
+At the first write of any file, the file is 'copied up' into tmpfs
+filesystem and there modified.  Any future reads of so-modified files
+happen on the overlay filesystem (e.g. only the new, modified version
+is served). Any future reads of non-modified files happen on the lower
+filesystem.  At shutdown (and perhaps even while running), the contents of
+the upper, overlay filesystem are synchronized onto the lower filesystem.
+
+For more confusing information, please read aufs(5) man page.
+
+Related files:
+  /etc/initramfs-tools/scripts/init-bottom/overlay  - mounts the overlay
+  /etc/init.d/overlay-sync   - script that runs at shutdown/reboot
+  /sbin/overlay-sync         - performs the actual synchonization, try it
+  /etc/overlay/vars.sh       - variables used by above three scripts
+  /etc/overlay/rsync-filter  - when syncing, listed files are excluded
+  /etc/overlay/README        - this file.
+
+Please fix bugs and help make more pretty, robust, and useful.

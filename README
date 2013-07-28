@@ -1,0 +1,8 @@
+How to use
+
+$ git clone git@github.com:Debwin/livemixmaker.git
+$ mkdir my-distro
+$ cd my-distro
+$ ../livemixmaker/livemixmaker init
+$ less config/README
+$ ../livemixmaker/livemixmaker --help

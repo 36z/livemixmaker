@@ -1,0 +1,74 @@
+#!/bin/sh
+
+SCRIPTNAME=/sbin/overlay-sync
+
+. /etc/overlay/vars.sh
+
+sync_files ()  # arguments are FILE paths to be synced
+{
+  if [ ! -x "$(which rsync)" ]; then
+    echo 'Error: need rsync to continue' >&2
+    exit 1
+  fi
+  (
+    flock --nonblock 9 || exit 1
+    # Do the work below
+
+    # mount filesystems
+    mount -o remount,rw "$RO_ROOT"
+    mount -o remount,rw "$RO_ROOT/home" 2>/dev/null
+    
+    for file in "$@"; do
+      # ensure directories end with /, otherwise rsync copies the dir itselt instead of the contents
+      file="$(readlink -f "$file")"
+      [ -d "$file" ] && file="$file/"
+      # TODO: replace rsync with the following algorithm:
+      #   1. remove from lower any files/dirs for which whiteouts exist on the upper
+      #   2. remove from lower any directories for which opaques exist on the upper (as dir_to_delete/.wh..wh..opq or whatever is in /etc/default/aufs)
+      #   3. copy over (cp --update?) stuff from upper branch to lower, with exception of .wh.* files and files excluded by RSYNC_FILTER (which may then be renamed appropriately)
+      # also clear rsync references in init.d script
+      rsync --exclude=lost+found --filter=". $RSYNC_FILTER" \
+        --archive --human-readable --progress --hard-links --sparse \
+        --one-file-system --xattrs --delete-during \
+        --log-file="$RSYNC_LOG" \
+        "/$file" "$RO_ROOT/$file"
+        # TODO: replace --progress with --verbose when sufficient rsync-filter testing
+    done
+    sync
+    # TODO: try 'auplink flush' before remounting back, if that is required
+    # if "fs is busy" examine with `lsof +f -- $RO_ROOT`
+    # TODO: also read these (and referenced) threads and consider all best aufs mount options: http://sourceforge.net/search/index.php?group_id=167503&type_of_search=mlists&ml_name[]=aufs-users&limit=100&q=auplink
+    mount -o remount,mod:$RO_ROOT=ro /
+    mount -o remount,mod:$RO_ROOT/home=ro /home
+    mount -o remount,ro "$RO_ROOT/home" 2>/dev/null
+    mount -o remount,ro "$RO_ROOT"
+  ) 9>"$LOCKFILE"
+  rm "$LOCKFILE"
+}
+
+case "$1" in
+  sync)
+    sync_files $DEFAULT_SYNC
+    exit $?
+    ;;
+  nosync)
+    touch /.nosync  # /etc/init.d/overlay-sync checks for this file
+    echo 'OK: Will not synchronize filesystems at shutdown.'
+    ;;
+  *)
+    if [ -e "$1" ]; then
+      sync_files "$@"
+      exit $?
+    fi
+    echo "Usage: $SCRIPTNAME sync
+       $SCRIPTNAME nosync
+       $SCRIPTNAME FILE ...
+
+Synchronize files from upper, overlay filesystem onto the lower, on-disk
+filesystem.
+
+The first invocation synchronizes dirs $(echo $DEFAULT_SYNC | sed 's/ / and /g').
+The second invocation prevents automatic synchronization at shutdown.
+The third invocation synchronizes only FILEs."
+    ;;
+esac

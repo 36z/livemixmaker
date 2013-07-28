@@ -1,0 +1,6 @@
+# /etc/fstab: static file system information.
+#
+# <file system>     <mount point>  <type>    <options>          <dump> <pass>
+
+LABEL=live-rootfs   /       ext4    rw,errors=remount-ro,noatime,discard,commit=120   0 1
+LABEL=live-home     /home   ext4    rw,errors=remount-ro,noatime,discard,commit=120,nofail  0 2

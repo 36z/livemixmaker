@@ -1,0 +1,103 @@
+
+===========================================================================
+ File & directory format
+===========================================================================
+
+This is livemixmaker config directory. In order to serve its function,
+this directory must include, at a minimum:
+  * a build.conf file (find example attached), and
+  * several directories with names matching regex format:
+
+      [0-9]+\.(confighooks|chroot|packages|package-lists|hooks)
+
+These directories are processed in sort-order (indicated by the numbers
+before the dot), while the suffix of each marks the action that will
+take place, as described below. The directories that start with 0 are
+processed below any parents (see below), and directories with names
+starting with 1-9 after.  You can customize the order of these actions
+to your needs. Empty and non-conforming directories are skipped.
+
+
+*.confighooks    Executable files in this directory execute inside this (./)
+                 config directory, not in chroot. They can be used for:
+                   * automating NFS mounts,
+                   * downloading of the latest *.deb packages,
+                   * any kind of reconfiguration of distribution config.
+                 On successful run (exit 0), confighooks are chmodded -x.
+                 If a hook file includes the following line somewhere in
+                 its body:
+
+                  # Provides: path_to_file
+
+                 then path_to_file is assumed to be relative path inside
+                 this (./) config directory. For example, a confighook
+                 that downloads the latest *.deb of Skype from Microsoft
+                 could contain a line:
+
+                  # Provides: packages/skype-*.deb
+
+                 When livemixmaker is run with 'cleanall' argument, all
+                 confighooks are chmodded back +x and any provided
+                 path_to_file files inside the config directory are deleted.
+
+
+*.chroot    Is a direct view of the root filesystem. Anything you put in
+            this directory will be copied over into resulting image
+            filesystem(s).
+
+
+*.packages    All *.deb packages in these directories are installed on
+              the target system. You can populate this directory, for
+              example, by means of confighooks.
+
+
+*.package-lists   Holds *.list files that are \n-separated package names
+                  to install, optionally prefixed with '-' to have them
+                  removed (or not installed).
+                  If a line in any of the *.list files starts with '!',
+                  then it is executed as a command line and interpreted
+                  as its output. (Similar to Live-Systems behavior.)
+
+
+*.hooks   The executable files in this directory are executed inside
+          chroot. Strongly consider maintaining all your —hook and
+          otherwise— scripts re-entrant, meaning that their execution
+          converges, preferrably with the first run, even if executed
+          multiple times.
+
+This is one example livemixmaker-compatible directory that builds 'myOS':
+  myOS/README
+  myOS/config/build.conf
+  myOS/config/1.package-lists/packages.list
+  myOS/config/2.chroot/home/user/About_myOS.PDF
+  myOS/config/3.hooks/modify_package_X
+
+
+===========================================================================
+ 'Parent' distributions
+===========================================================================
+
+Any livemixmade distribution can be derived from one or several parents
+specified in ./build.conf file. When parents are specified, any 0.*
+directories (of above) are processed before any parents. This way
+you can even dynamically set parents if you wish, e.g. with a script in
+0.confighooks directory. Directories [1-9].* are processed after parents
+are built. Intermediate completed stages are cached per best effort.
+
+
+===========================================================================
+ livemixmaker usage
+===========================================================================
+
+Run livemixmaker in the parent directory (../) where 'config' directory is
+present. For example:
+  $ cd my-distro-project
+  $ ls                            # note the config directory present
+  config  about_my_distro.txt
+  $ sudo livemixmaker             # you run livemixmaker here
+  ...
+
+If you know it by heart, this file (./README) can be safely deleted,
+or populated with more appropriate content.
+
+Please read livemixmaker's --help for more information regarding its use.

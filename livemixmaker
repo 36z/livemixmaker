@@ -1,0 +1,427 @@
+#!/bin/bash
+
+shopt -s expand_aliases
+
+LIBS="$(dirname $0)"
+set -e
+# source livemixmaker helper functions
+. "$LIBS/functions.sh"
+
+# TODO: examine this and associated functions.sh source code and provide advisory guidance about refactoring and best practices
+
+case "$1" in
+  init )
+    if [ -e ./config ]; then
+      echo "ERROR: directory 'config' already exists. Please rename or remove it first."
+      exit 4
+    fi
+    cp "$LIBS/default_config" ./config
+    exit 0
+    ;;
+esac
+
+# if wrong number or arguments supplied, print usage
+if [ "$#" = "0" -o $# -gt 1 ]; then
+  print_usage
+  exit 1
+fi
+
+
+#startprogargs--- format below: ARG_NAME=${...:-default value} # comment ---
+ARCH="${ARCH:-i386}"      # i386 or amd64 or whatever; passed to debootstrap
+SUITE="${SUITE:-stable}"  # default debian channel (wheezy, testing, ...)
+FLAVOR="$FLAVOR"  # currently unused, but can be used in hooks
+DEBIAN_MIRROR="${DEBIAN_MIRROR:-http://http.debian.net/debian}"  # your preferred apt-compatible mirror, or sane default
+MIRROR_PROXY="${MIRROR_PROXY:-http://localhost:3142/}"  # apt-cacher-ng proxy, use it!
+APT_OPTIONS="$APT_OPTIONS"  # additional options passed to apt-get lines (besides proxy, dpkg force-confold, ...)
+ARCHIVE_AREAS="${ARCHIVE_AREAS:-main contrib non-free}"  # speaks for itself
+OVERLAYFS="${OVERLAYFS-aufs}"  # use overlay copy on write filesystem, currently aufs is supported or none for direct 'access'
+REBUILD="${REBUILD:-}"  # set this to something if you want to rebuild from scratch even if base stage (debootstrap including configured parents) is complete
+IGNORE_ERRORS="${IGNORE_ERRORS:-}" # if set, proceed even if errors are present
+
+BUILD="${BUILD:-$(pwd)/build}"  # build directory, the default that you needn't change
+CHROOT="${CHROOT:-$(pwd)/build/chroot}"  # the chroot mount inside build directory, similarly
+CHROOT_CONFIG='/_livemixmaker/config'  # your ./config gets copied inside chroot (...bind-mounted, really, so use it read-only!); the variable can be referenced inside hooks to pull-in resources
+
+# additionally, unset by default:
+# KERNEL_PACKAGE="linux-image-{arch} other_essential_packages" - default is provided for i386 and amd64 builds
+# NO_GRUB - set to skip grub2 installation
+# additionally, you can use in your hooks:
+# DEVICE - a /dev/loopX disk device. Access partitions like /dev/loopXp2
+#endprogargs-------------------------------------------------------------
+
+
+# enable loop device partition detection (accessible as /dev/loop0p1 ...)
+if ! [ $(cat /sys/module/loop/parameters/max_part 2>/dev/null) -ge 4 ] 2>/dev/null; then
+  modprobe -rf loop && modprobe loop max_part=4
+fi
+
+# source configs
+CONFIG_DIR="$(pwd)/config"  # this is the original ./config dir
+if [ -d "$CONFIG_DIR" ]; then
+  . $CONFIG_DIR/build.conf
+  unset separate_home
+  [ "${HOME_SIZE::1}" != "0" ] && separate_home="True"
+else
+  echo "ERROR: '$CONFIG_DIR' is not a configuration directory."
+  print_usage
+  trap '' EXIT  # nothing done yet, no clean-up necessary
+  exit 6
+fi
+
+trap "cleanup 2>/dev/null" EXIT HUP INT QUIT TERM
+
+case "$1" in
+  init )
+    # processed above
+    ;;
+  build )
+    test_admin
+    if [ ! -e ./config ]; then
+      echo "ERROR: 'config' directory doesn't exist in $PWD."
+      exit 5
+    fi
+    ;;
+  clean )
+    test_admin
+    umount_devices 2>/dev/null || true
+    umount_filesystems 2>/dev/null || true
+    losetup_detach 2>/dev/null || true
+    cd build
+    clean_build
+    exit 0
+    ;;
+  cleanall )
+    test_admin
+    # clean inside the config dir as well
+    for dir in config/*.confighooks; do
+      [ ! -e "$dir" ] && continue
+      for file in $dir/*; do
+        # ensure only script files are processed
+        if is_script_file "$file"; then
+          chmod --verbose +x "$file"
+          # remove any files provided by these scripts
+          provides="$(cat "$file" | grep -P '^#\s*Provides:' | sed -r 's/^#\s*Provides://')"
+          if [ "$provides" != '' ]; then
+            for package in $provides; do
+              rm --verbose -r "config/$package" || true
+            done
+          fi
+        fi
+      done
+    done
+    umount_devices 2>/dev/null || true
+    umount_filesystems 2>/dev/null || true
+    losetup_detach 2>/dev/null || true
+    rm -rv build
+    exit 0
+    ;;
+  gzip )
+    test_admin
+    cd "$BUILD"
+    losetup_attach
+    mount_filesystems
+    # careful! mounting filesystems adds associated diversions that we need to revert
+    reset_ischroot
+    reset_resolv_conf
+    destroy_policyrc_d_101
+    # now...
+    zero_partitions
+    echo 'Compressing ...'
+    gzip --fast --stdout --verbose binary.img > ../binary.img.gz
+    umount_filesystems
+    losetup_detach
+    echo 'All done.'
+    echo 'Install binary.img.gz with:
+ $ sudo su
+ $ gzip -dc < binary.img.gz > /dev/sdX ; sync'
+    echo 'Enjoy! :)'
+    exit 0
+    ;;
+  mount )
+    cd "$BUILD"
+    test_admin
+    losetup_attach
+    mount_filesystems
+    mount_devices
+    trap '' EXIT
+    exit 0
+    ;;
+  u*mount|mountu )
+    cd "$BUILD"
+    test_admin
+    # do nothing, device will be unmounted on exit cleanup
+    exit 0
+    ;;
+  vbox )
+    if [ ! -x "$(which qemu-img)" ]; then
+      echo 'Need qemu-img to convert images. Install qemu-utils package.'
+      exit 1
+    fi
+    echo -n 'Converting binary.img to VirtualBox (VMDK) format ...'
+    qemu-img convert -O vmdk build/binary.img binary.vmdk
+    echo ' done.'
+    exit 0
+    ;;
+  * )
+    echo "ERROR: unknown option $1"
+    print_usage
+    exit 1
+esac
+
+
+#### continue with 'build' code path
+
+
+# redirect copy of stdout to log file from within the script itself
+log_file="build-$(date +%y%m%d%H%M%S).log"
+exec >  >(tee -a $log_file)
+exec 2> >(tee -a $log_file >&2)
+
+mkdir "$BUILD" || true
+cd "$BUILD"
+
+
+
+# TODO is possbile, warn if total selected package size (+20%) is over rootfs capacity, optionally care to extend it
+
+export DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true DEBIAN_PRIORITY=critical  # don't ask questions
+export LC_ALL=C LANGUAGE=C LANG=C  # Perl needs to be told to accept that no locales are available yet and not to complain
+
+
+# check if binary image exists from previous build
+if [ ! $REBUILD ] && [ -f base.stage ] && config_diff <(skip_comments ./config/build.conf) <(skip_comments ${CONFIG_DIR}/build.conf); then
+  env echo -e "\n\nWARNING:  Using previous built image. Only additions in changes/packages will be applied and nothing will be removed/reverted. If this is undesired, run 'livemixmaker clean' first.\n\n\n"
+  sleep 2
+else
+  build_from_scratch="True"
+fi
+
+
+#
+############### end configuration, start procedure ##################333
+#
+
+# export all shell variables (including preferences from build.conf, run agruments, etc.)
+set +e
+  while read variable; do
+    if [ "${variable::2}" = "_=" ]; then break; fi  # as observed, declare outputs variables first, followed by $_ variable, followed by everything else
+    export "$(echo $variable | sed 's/=.*\$//')" 2>/dev/null || true
+  done < <(declare)
+set -e  # without these, it breaks :S
+
+if [ $IGNORE_ERRORS ]; then
+  set +e
+  echo 'WARNING: Ignoring errors.'
+fi
+
+if [ $build_from_scratch ]; then
+  # reset build environment
+  clean_build
+  
+  
+  # allocate and partition device
+  if ! fallocate --length ${IMG_SIZE} binary.img; then
+    echo "ERROR: file too large: IMG_SIZE=$IMG_SIZE"
+    exit 17
+  fi
+  echo 'Creating partitions ...'
+  losetup_attach
+  # TODO: scripted fdisk, which would due to --align=opt and auto position be preferred, hangs
+  # [ $separate_home ] && home_fragment="+${ROOT_SIZE} n p   "  # after root, remaining is home
+  # fdisk_script="o n p 5 +${NTFS_SIZE} n p  ${home_fragment} a 2 t 1 7 v w "  # 5cyl start = room for bootloader
+  # echo "Formatting ${DEVICE} with the following script: $fdisk_script"
+  # echo "$fdisk_script" | tr ' ' '\n' | fdisk --align opt ${DEVICE}
+  #~
+
+  # convert quantities to plain int MB
+  ntfs_MB="$NTFS_SIZE" && to_MB ntfs_MB
+  root_MB="$ROOT_SIZE" && to_MB root_MB
+
+  alias parted="parted --script --align opt"
+  parted $DEVICE mklabel msdos
+  parted $DEVICE mkpart primary ntfs 1MB $(($ntfs_MB + 1))MB
+  root_start=$(($ntfs_MB + 2))
+  if [ $separate_home ]; then
+    root_end="$(($root_start + $root_MB))"
+    parted $DEVICE mkpart primary ext2 ${root_start}MB ${root_end}MB
+    home_start=$(($root_end + 1))
+    parted $DEVICE mkpart primary ext2 ${home_start}MB 100%
+  else
+    parted $DEVICE mkpart primary ext2 ${root_start}MB 100%
+  fi
+  parted $DEVICE set 2 boot on
+  sync ; sleep 1
+  losetup_detach || true
+  sleep 1
+  losetup_attach
+
+  # make filesystems
+  echo 'Formatting filesystems ...'
+  mkfs.ntfs -v --no-indexing   -L live-usb ${DEVICE}p1
+  mkfs.ext4 -v -O ^has_journal -L live-rootfs ${DEVICE}p2
+  [ $separate_home ] &&
+  mkfs.ext4 -v -O ^has_journal -L live-home ${DEVICE}p3
+
+  mount_filesystems
+
+  if [ -e cache/parentbase.tar.gz ]; then
+    echo 'Restoring parent base ...'
+    restore_chroot "cache/parentbase.tar.gz"
+    [ ! $NO_GRUB ] &&
+      chroot_exec "grub-install --modules='part_msdos' --boot-directory=/boot ${DEVICE} ; rm /boot/grub/device.map"  # reinstall grub
+  else
+    # install bootstrap packages
+    if [ -e cache/debootstrap.tar.gz ]; then
+      echo -n 'Restoring bootstrap stage ...'
+      restore_chroot "cache/debootstrap.tar.gz"
+      echo 'done.'
+    else
+      cdebootstrap --verbose --arch "$ARCH" "$SUITE" "$CHROOT" "${MIRROR_PROXY}/$(strip_url_scheme $DEBIAN_MIRROR)"
+      echo -n 'Backing up debootstrap stage ...'
+      backup_chroot "cache/debootstrap.tar.gz"
+      echo 'done.'
+    fi
+    umount_filesystems
+    mount_filesystems
+
+    # create user config
+    #~ chroot_exec "/bin/echo -e 'live\nlive\n' | adduser --disabled-password --gecos 'Live User' user"
+    chroot_exec "/bin/echo -e 'live\nlive\n' | adduser --gecos 'Live User' user"
+    mkdir "$CHROOT/etc/sudoers.d"
+    echo "user ALL=(ALL) NOPASSWD: ALL" > "$CHROOT/etc/sudoers.d/live_user"  # user doesn't need to provide password
+
+    mount_devices
+
+    # avoid 'df: Warning: cannot read table of mounted file systems'
+    ln -s "$CHROOT/proc/mounts" "$CHROOT/etc/mtab"
+
+    # set new /etc/apt/sources.list
+    echo "deb $DEBIAN_MIRROR $SUITE ${ARCHIVE_AREAS//\'/}" > "$CHROOT/etc/apt/sources.list"  # ARCHIVE_AREAS was quoted when exported because of spaces
+
+    # install kernel and grub
+    if [ $KERNEL_PACKAGE ]; then
+      chroot_aptget "update"
+      chroot_aptget "install $KERNEL_PACKAGE"
+    else
+      if [ "${ARCH}" = "i386" ]; then
+        chroot_aptget "update"
+        chroot_aptget "install linux-image-686-pae"
+      elif [ "${ARCH}" = "amd64" ]; then
+        chroot_exec "dpkg --add-architecture i386"
+        chroot_aptget "update"
+        chroot_aptget "install linux-image-amd64"
+      else
+        echo "ERROR: unknown kernel for ARCH=${ARCH}; specify it as KERNEL_PACKAGE"
+        exit 1
+      fi
+    fi
+    cp "$LIBS/default_chroot/etc/fstab" "$CHROOT/etc/fstab"
+
+    # optionally install overlay filesystem
+    if [ $OVERLAYFS = "aufs" ]; then
+      chroot_aptget "install aufs-tools rsync lsb-base"
+      cp "$LIBS/default_chroot/etc/initramfs-tools/." "$CHROOT/etc/initramfs-tools/"
+      cp "$LIBS/default_chroot/etc/overlay" "$CHROOT/etc/"
+      cp "$LIBS/default_chroot/etc/init.d/overlay-sync" "$CHROOT/etc/init.d/"
+      cp "$LIBS/default_chroot/sbin/overlay-sync" "$CHROOT/sbin/"
+      chroot_exec "update-rc.d overlay-sync stop 01 0 6"
+      chroot_exec "update-initramfs -k all -u"
+    fi
+
+    # optionally? install grub bootloader  
+    if [ ! $NO_GRUB ]; then
+      chroot_aptget "install grub2"
+      chroot_exec "grub-install  --modules='part_msdos' --boot-directory=/boot ${DEVICE}"  # part_msdos #696718
+      # disable grub-entry autodiscovery, because it identifies disk by-uuid, not by-label which is what we need
+      chroot_exec "chmod -x /etc/grub.d/00_header /etc/grub.d/10_linux /etc/grub.d/20_linux_xen /etc/grub.d/30_os-prober"  # linux autodetection won't work...
+      cp "${LIBS}/default_chroot/etc/grub.d/40_permanent" "$CHROOT/etc/grub.d/"  # ...so we make our own
+      chroot_exec "update-grub"
+    fi
+
+    # set random hostname :D
+    hostname="debwin-${RANDOM::3}"
+    echo $hostname > "${CHROOT}/etc/hostname"
+    echo "127.0.0.1 localhost
+127.0.1.1 $hostname
+# The following lines are desirable for IPv6 capable hosts
+::1     localhost ip6-localhost ip6-loopback
+fe00::0 ip6-localnet
+ff00::0 ip6-mcastprefix
+ff02::1 ip6-allnodes
+ff02::2 ip6-allrouters
+ff02::3 ip6-allhosts" > "${CHROOT}/etc/hosts"
+
+    # execute config/0.* before processing parents
+    for dir in $(ls --directory $CONFIG_DIR/0.* 2>/dev/null); do
+      dir="$(basename $dir)"
+      process_func="$(get_processing_function ${dir:2})"
+      [ $process_func ] && eval $process_func "$CONFIG_DIR/$dir" ||
+        echo "warning: skipping $dir"
+    done
+
+    # process parents
+    process_config_parents "$CONFIG_DIR"
+
+    umount_devices
+    echo 'Backing up parent base ...'
+    backup_chroot "cache/parentbase.tar.gz"
+  fi
+
+  # copy essential config for future reference (e.g. diffing build.conf above)
+  mkdir config
+  cp "$CONFIG_DIR/build.conf" ./config/
+  # mark success, save environment
+  declare | sed -n '0, /^_=/p' > base.stage
+  
+  umount_filesystems
+  sync; sleep 1; sync
+  losetup_detach
+fi
+
+# FIXME: don't detach/reattach, instead attach if not already
+sleep 1; losetup_attach; sleep 1
+mount_filesystems
+mount_devices
+
+# execute the rest of the config rules
+for dir in $(ls --directory $CONFIG_DIR/[1-9]*\.* 2>/dev/null); do
+  dir="$(basename $dir)"
+  process_func="$(get_processing_function ${dir#[1-9]*.})"
+  [ $process_func ] && eval $process_func "$CONFIG_DIR/$dir" ||
+    echo "warning: skipping $dir"
+done
+
+# after copying user's chroot, again ...
+[ ! $NO_GRUB ] && chroot_exec "update-grub"  # rerun to incorporate chroot updates
+#~ chroot_exec "update-command-not-found || true"
+#~ chroot_exec "apt-file update || true"
+chroot_exec "apt-get clean"
+chroot_exec "adduser user sudo"
+chroot_exec "dpkg --get-selections > /installed-packages.txt" &&
+  mv "$CHROOT/installed-packages.txt" "$BUILD"
+chroot_exec "updatedb || true"
+chroot_exec "rm -rf /tmp/*"
+chroot_exec "rm /boot/grub/device.map"  # if this file is used by grub, disk may not be found
+# copy over any new user templates from /etc/skel, which may have changed after the user was created
+cp --update "${CHROOT}/etc/skel/." "${CHROOT}/home/user/" || true
+
+
+### Print 'executive' build report
+sync
+errors="$(grep -iP '\b(E|W):|\berr(or)?\b|\bwarn(ing)?\b' ../$log_file)"
+if [ $errors ]; then
+  echo -e '\n\nErrors and warnings issued:\n'
+  echo -e "$errors \n"
+fi
+
+
+
+
+#### All done.
+
+echo "Done. Image file is $BUILD/binary.img"
+echo "Run 'livemixmaker gzip' to minimize it,
+or copy to USB with \`cp build/binary.img /dev/sdX ; sync\`"
+
+set +e

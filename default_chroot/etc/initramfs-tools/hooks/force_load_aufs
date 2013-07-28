@@ -1,0 +1,4 @@
+#!/bin/sh
+
+. /usr/share/initramfs-tools/hook-functions
+force_load aufs
